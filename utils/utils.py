@@ -139,15 +139,15 @@ async def download_file(gid: str, ctx: SlashContext, message: Message) -> bool |
         except StopIteration:
             return True
         
-        # Check for file size limit
-        if status["full_size_bytes"] > 10 * 1024 * 1024 * 1024: # More than 10 GB
+        # Check for file size limit (Increased to 20 GB)
+        if status["full_size_bytes"] > 20 * 1024 * 1024 * 1024: # More than 20 GB
             aria2_service.remove_all_downloads(force=True)
             file_utils.clear_current_dl()
             file_utils.clear_temp()
             await message.edit(
-                content="Error: The file size exceeds 10GB. Please download smaller files."
+                content="Error: The file size exceeds 20GB. Please download smaller files."
             )
-            logger.error("The file size exceeds 10GB for GID: %s", gid)
+            logger.error("The file size exceeds 20GB for GID: %s", gid)
             return False
 
         # Check for errors in status
@@ -187,7 +187,7 @@ async def extract_from_download(gid: str, ctx: SlashContext, message: Message, d
     all_files_dict = file_utils.get_temp_files(dir_path)
     files = all_files_dict["filenames"] if all_files_dict else []
     full_paths = all_files_dict["full_paths"] if all_files_dict else []
-    # Check if there are any matroska files to extract
+# Check if there are any matroska files to extract
     if not files:
         await ctx.send("No Matroska files (.mkv, .mk3d, .mka) found for extraction.")
         logger.warning("No Matroska files found for extraction, Extraction aborted.")
@@ -195,12 +195,26 @@ async def extract_from_download(gid: str, ctx: SlashContext, message: Message, d
         file_utils.clear_current_dl()
         file_utils.clear_temp()
         return
-    # Send list of files to be processed
-    all_files_str = "\n- ".join(files)
-    await ctx.send(
-        f"Files List:\n"
-        f"```- {all_files_str}```"
-    )
+        
+    # Chunk the files list to respect Discord's 2000-character limit
+    header = "Files List:\n"
+    current_chunk = header + "```text\n"
+
+    for file_name in files:
+        line = f"- {file_name}\n"
+        # Check against 1990 to leave room for the closing "```"
+        if len(current_chunk) + len(line) > 1990:
+            current_chunk += "```"
+            await ctx.send(current_chunk)
+            # Reset chunk for the next message
+            current_chunk = "```text\n" + line 
+        else:
+            current_chunk += line
+
+    # Send the final remaining chunk if it contains files
+    if current_chunk not in (header + "```text\n", "```text\n"):
+        current_chunk += "```"
+        await ctx.send(current_chunk)
 
     # Perform extraction
     for i, file in enumerate(full_paths, start=1):
@@ -281,12 +295,34 @@ async def extract_from_download(gid: str, ctx: SlashContext, message: Message, d
             
             if extraction_type in ["audio", "all"] and zipped_audio and len(zipped_audio.paths) > 1:
                 merge_commands += f"{get_merge_commands(zipped_audio.paths, 'audio')}\n"
+
+            if merge_commands:
+                merge_commands_path = file_utils.save_file_to_extract_dir(
+                    merge_commands.encode("utf-8"), "merge_commands.txt"
+                )
+                files.append(merge_commands_path)
             
-            await message.edit(
-                content=summary + merge_commands,
-                files=[File(file=f, file_name=os.path.basename(f)) for f in files if f is not None]
-            )
-            logger.info("Finished upload results for: %s", os.path.basename(file))
+            # Filter out None values and prepare your list of Discord File objects
+            valid_files = [File(file=f, file_name=os.path.basename(f)) for f in files if f is not None]
+
+            # Split the files into batches of 10 to comply with Discord's strict limits
+            file_chunks = [valid_files[i:i + 10] for i in range(0, len(valid_files), 10)]
+
+            if file_chunks:
+                # Edit the initial message with the summary text and the first 10 files
+                await message.edit(
+                    content=summary,
+                    files=file_chunks[0]
+                )
+                
+                # If there are more than 10 files, send the remaining batches as new messages
+                for extra_chunk in file_chunks[1:]:
+                    await ctx.send(files=extra_chunk)
+            else:
+                # Fallback if somehow there are absolutely no files to attach
+                await message.edit(content=summary)
+
+            logger.info("Finished upload results for: %s (Total files sent: %d)", os.path.basename(file), len(valid_files))
         except Exception as e:
             await ctx.send(f"An error occurred while extracting MKV info from `{os.path.basename(file)}`: {e}")
             logger.error("An error occurred while extracting MKV info from %s: %s", os.path.basename(file), e)
